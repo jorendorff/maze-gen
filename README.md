@@ -42,7 +42,12 @@ The expected run time is O(N^2 log N) in the side length, a bit worse than linea
 
 The approach is [Wilson's algorithm](https://en.wikipedia.org/wiki/Maze_generation_algorithm#Wilson's_algorithm), modified slightly to enable parallelism, at the cost of locality.
 
-Questions raised:
+## Questions raised
 
-- Since this uses a fast but not cryptographic-quality RNG, does it satisfy the uniformity requirement?
-- 
+The main question I had throughout this exercise was how strictly I was required to take the uniformity requirement.
+
+I assumed it was intended strictly, even though that is a little bit ridiculous, because interview questions are allowed to be a little ridiculous. Admittedly, this means using Xorshift as the RNG would not be strictly OK; the number of possible mazes is vastly greater than its state space...
+
+Appropriately for the task, I feel my progress was extremely *path-dependent*. Having gone one direction with the implementation, I was locked in. Given only 2 hours, incremental improvements were far more likely to produce a decent outcome than trying two or three very different approaches.
+
+For example: Claude very quickly found [a paper by Sarah Cannon et al.](https://arxiv.org/abs/2508.11130), "Sampling tree-weighted partitions without sampling trees", but I barely had time to look at it. It's anybody's guess if this could possibly fare better than Wilson's. (I suspect not; it's also O(n^2 log n) and it seems like Wilson's constant factors should be hard to beat.)
