@@ -358,10 +358,38 @@ fn wilson_fill(grid: &Grid, rect: &Rect, rng: &mut u64) {
 fn wilson_walk_from(grid: &Grid, start: u64, rng: &mut u64) {
     let n = grid.n;
     let mut cur = start;
+    let mut row = cur / n;
+    let mut col = cur % n;
+    // Bit buffer: 32 two-bit direction picks per xorshift64 call.
+    let mut bits: u64 = 0;
+    let mut bits_left: u32 = 0;
+
     grid.or(cur, IN_WALK);
 
     loop {
-        let (next, dir, _) = random_neighbor(cur, n, rng);
+        // Pick a random neighbor.
+        let (next, dir, next_row, next_col);
+        if row > 0 && row < n - 1 && col > 0 && col < n - 1 {
+            // Fast path: interior cell, all 4 neighbors valid.
+            if bits_left == 0 {
+                bits = xorshift64(rng);
+                bits_left = 32;
+            }
+            dir = (bits & 3) as u8;
+            bits >>= 2;
+            bits_left -= 1;
+            match dir {
+                DIR_RIGHT => { next = cur + 1; next_row = row; next_col = col + 1; }
+                DIR_DOWN  => { next = cur + n; next_row = row + 1; next_col = col; }
+                DIR_LEFT  => { next = cur - 1; next_row = row; next_col = col - 1; }
+                _         => { next = cur - n; next_row = row - 1; next_col = col; }
+            }
+        } else {
+            // Slow path: edge cell, 2 or 3 valid neighbors.
+            (next, dir, next_row, next_col) =
+                edge_neighbor(cur, row, col, n, rng);
+        }
+
         let val = grid.get(cur);
         grid.set(cur, (val & !WALK_DIR_MASK) | (dir << WALK_DIR_SHIFT));
 
@@ -372,9 +400,13 @@ fn wilson_walk_from(grid: &Grid, start: u64, rng: &mut u64) {
             grid.and_assign(cur, !IN_WALK);
             erase_loop(grid, n, next, cur);
             cur = next;
+            row = next_row;
+            col = next_col;
         } else {
             grid.or(next, IN_WALK);
             cur = next;
+            row = next_row;
+            col = next_col;
         }
     }
 
@@ -408,6 +440,32 @@ fn erase_loop(grid: &Grid, n: u64, loop_start: u64, loop_end: u64) {
     }
 }
 
+/// Pick a random neighbor of an edge cell at (row, col). Returns (pos, dir, row, col).
+#[inline(never)]
+fn edge_neighbor(cur: u64, row: u64, col: u64, n: u64, rng: &mut u64) -> (u64, u8, u64, u64) {
+    let mut count: u8 = 0;
+    if col + 1 < n { count += 1; }
+    if row + 1 < n { count += 1; }
+    if col > 0 { count += 1; }
+    if row > 0 { count += 1; }
+    let choice = (xorshift64(rng) % count as u64) as u8;
+    let mut idx: u8 = 0;
+    if col + 1 < n {
+        if idx == choice { return (cur + 1, DIR_RIGHT, row, col + 1); }
+        idx += 1;
+    }
+    if row + 1 < n {
+        if idx == choice { return (cur + n, DIR_DOWN, row + 1, col); }
+        idx += 1;
+    }
+    if col > 0 {
+        if idx == choice { return (cur - 1, DIR_LEFT, row, col - 1); }
+        idx += 1;
+    }
+    let _ = idx;
+    (cur - n, DIR_UP, row - 1, col)
+}
+
 /// Carve a passage between `from` and `to` (which must be neighbors).
 fn carve(grid: &Grid, from: u64, to: u64, dir: u8) {
     match dir {
@@ -430,39 +488,6 @@ fn step(pos: u64, n: u64, dir: u8) -> (u64, u8, u8) {
     }
 }
 
-/// Pick a uniformly random valid neighbor of `pos` in the NxN grid.
-fn random_neighbor(pos: u64, n: u64, rng: &mut u64) -> (u64, u8, u8) {
-    let row = pos / n;
-    let col = pos % n;
-
-    let mut count: u8 = 0;
-    if col + 1 < n { count += 1; }
-    if row + 1 < n { count += 1; }
-    if col > 0 { count += 1; }
-    if row > 0 { count += 1; }
-
-    let choice = (xorshift64(rng) % count as u64) as u8;
-    let mut idx: u8 = 0;
-
-    if col + 1 < n {
-        if idx == choice { return (pos + 1, DIR_RIGHT, DIR_LEFT); }
-        idx += 1;
-    }
-    if row + 1 < n {
-        if idx == choice { return (pos + n, DIR_DOWN, DIR_UP); }
-        idx += 1;
-    }
-    if col > 0 {
-        if idx == choice { return (pos - 1, DIR_LEFT, DIR_RIGHT); }
-        idx += 1;
-    }
-    if row > 0 {
-        if idx == choice { return (pos - n, DIR_UP, DIR_DOWN); }
-        idx += 1;
-    }
-    let _ = idx;
-    unreachable!()
-}
 
 fn xorshift64(state: &mut u64) -> u64 {
     let mut s = *state;
