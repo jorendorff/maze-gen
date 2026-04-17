@@ -31,6 +31,64 @@ const DIR_DOWN: u8 = 1;
 const DIR_LEFT: u8 = 2;
 const DIR_UP: u8 = 3;
 
+/// Below this area (in cells), stop subdividing and use plain Wilson's.
+const SUBDIVISION_THRESHOLD: u64 = 256 * 256;
+
+// ---------------------------------------------------------------------------
+// Grid: a shared, thread-safe view of the mmap'd maze buffer.
+//
+// Safety: parallel callers must access non-overlapping cell regions.  The
+// recursive subdivision guarantees this — once a barrier row/column is fully
+// in-tree, the two halves touch disjoint cells.  (The only exception is the
+// carve step for DIR_UP / DIR_LEFT, which sets a wall bit on an adjacent
+// barrier cell.  This is a benign race: the writes are to distinct bits from
+// any concurrent reads, and byte stores are atomic on all target platforms.)
+// ---------------------------------------------------------------------------
+
+struct Grid {
+    ptr: *mut u8,
+    n: u64,
+}
+
+unsafe impl Send for Grid {}
+unsafe impl Sync for Grid {}
+
+impl Grid {
+    #[inline(always)]
+    fn get(&self, pos: u64) -> u8 {
+        unsafe { *self.ptr.add(pos as usize) }
+    }
+
+    #[inline(always)]
+    fn set(&self, pos: u64, val: u8) {
+        unsafe { *self.ptr.add(pos as usize) = val; }
+    }
+
+    #[inline(always)]
+    fn or(&self, pos: u64, bits: u8) {
+        unsafe { *self.ptr.add(pos as usize) |= bits; }
+    }
+
+    #[inline(always)]
+    fn and_assign(&self, pos: u64, mask: u8) {
+        unsafe { *self.ptr.add(pos as usize) &= mask; }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Rect {
+    row_start: u64,
+    row_end: u64,   // exclusive
+    col_start: u64,
+    col_end: u64,   // exclusive
+}
+
+impl Rect {
+    fn height(&self) -> u64 { self.row_end - self.row_start }
+    fn width(&self) -> u64 { self.col_end - self.col_start }
+    fn area(&self) -> u64 { self.height() * self.width() }
+}
+
 fn usage() -> ! {
     eprintln!("usage: maze-gen N [OUTPUT]");
     eprintln!("       maze-gen show FILE");
@@ -71,7 +129,10 @@ fn main() -> io::Result<()> {
     let file = create_file(output, total_cells)?;
     let mut mmap = unsafe { MmapMut::map_mut(&file)? };
 
-    generate_maze(&mut mmap, n);
+    {
+        let grid = Grid { ptr: mmap.as_mut_ptr(), n };
+        generate_maze(&grid);
+    }
 
     // Clear bookkeeping bits before writing to disk.
     for byte in mmap.iter_mut() {
@@ -190,104 +251,175 @@ fn create_file(path: &str, size: u64) -> io::Result<File> {
     Ok(file)
 }
 
-/// Wilson's algorithm: generates a uniform spanning tree of the NxN grid.
-fn generate_maze(grid: &mut [u8], n: u64) {
-    // Use a simple xorshift64 PRNG seeded from the grid size.
-    let mut rng_state: u64 = 0xdeadbeef ^ (n.wrapping_mul(0x517cc1b727220a95));
-    if rng_state == 0 {
-        rng_state = 1;
+// ---------------------------------------------------------------------------
+// Maze generation: recursive subdivision + Wilson's algorithm
+// ---------------------------------------------------------------------------
+
+fn generate_maze(grid: &Grid) {
+    let n = grid.n;
+    if n <= 1 {
+        if n == 1 {
+            grid.or(0, IN_MAZE);
+        }
+        return;
     }
 
-    let total = n * n;
+    // Place the root in the first seeded line so the initial barrier walks
+    // find an in-tree cell immediately.
+    let mid_row = n / 2;
+    grid.or(mid_row * n, IN_MAZE);
 
-    // Mark cell 0 as in the maze (arbitrary root).
-    grid[0] |= IN_MAZE;
-    let mut in_maze_count: u64 = 1;
+    let full = Rect { row_start: 0, row_end: n, col_start: 0, col_end: n };
+    let seed = 0xdeadbeef ^ n.wrapping_mul(0x517cc1b727220a95);
+    generate_region(grid, full, seed);
+}
 
-    // Scan position for finding the next cell not yet in the maze.
-    let mut scan: u64 = 1;
+fn generate_region(grid: &Grid, rect: Rect, rng_seed: u64) {
+    if rect.area() == 0 {
+        return;
+    }
 
-    while in_maze_count < total {
-        // Find the next cell not in the maze.
-        while grid[scan as usize] & IN_MAZE != 0 {
-            scan += 1;
+    if rect.area() <= SUBDIVISION_THRESHOLD {
+        let mut rng = rng_seed;
+        if rng == 0 { rng = 1; }
+        wilson_fill(grid, &rect, &mut rng);
+        return;
+    }
+
+    let mut rng = rng_seed;
+    if rng == 0 { rng = 1; }
+
+    if rect.height() >= rect.width() {
+        let mid = rect.row_start + rect.height() / 2;
+        seed_row(grid, mid, rect.col_start, rect.col_end, &mut rng);
+
+        let top = Rect { row_end: mid, ..rect };
+        let bottom = Rect { row_start: mid + 1, ..rect };
+        let (sa, sb) = (xorshift64(&mut rng), xorshift64(&mut rng));
+
+        rayon::join(
+            || generate_region(grid, top, sa),
+            || generate_region(grid, bottom, sb),
+        );
+    } else {
+        let mid = rect.col_start + rect.width() / 2;
+        seed_col(grid, mid, rect.row_start, rect.row_end, &mut rng);
+
+        let left = Rect { col_end: mid, ..rect };
+        let right = Rect { col_start: mid + 1, ..rect };
+        let (sa, sb) = (xorshift64(&mut rng), xorshift64(&mut rng));
+
+        rayon::join(
+            || generate_region(grid, left, sa),
+            || generate_region(grid, right, sb),
+        );
+    }
+}
+
+/// Seed every cell in a row into the tree, forming a horizontal barrier.
+fn seed_row(grid: &Grid, row: u64, col_start: u64, col_end: u64, rng: &mut u64) {
+    let n = grid.n;
+    for c in col_start..col_end {
+        let pos = row * n + c;
+        if grid.get(pos) & IN_MAZE == 0 {
+            wilson_walk_from(grid, pos, rng);
         }
-        let start = scan;
+    }
+}
 
-        // Perform a loop-erased random walk from `start` until we hit the maze.
-        let mut cur = start;
-        grid[cur as usize] |= IN_WALK;
+/// Seed every cell in a column into the tree, forming a vertical barrier.
+fn seed_col(grid: &Grid, col: u64, row_start: u64, row_end: u64, rng: &mut u64) {
+    let n = grid.n;
+    for r in row_start..row_end {
+        let pos = r * n + col;
+        if grid.get(pos) & IN_MAZE == 0 {
+            wilson_walk_from(grid, pos, rng);
+        }
+    }
+}
 
-        loop {
-            // Pick a random valid neighbor.
-            let (next, dir, _reverse_dir) = random_neighbor(cur, n, &mut rng_state);
-            // Record the direction we leave `cur`.
-            grid[cur as usize] = (grid[cur as usize] & !WALK_DIR_MASK)
-                | (dir << WALK_DIR_SHIFT);
-
-            if grid[next as usize] & IN_MAZE != 0 {
-                // Reached the maze — stop the walk.
-                break;
-            }
-            if grid[next as usize] & IN_WALK != 0 {
-                // Loop detected — erase it.  Clear IN_WALK on `cur` since
-                // it is part of the loop being removed.
-                grid[cur as usize] &= !IN_WALK;
-                erase_loop(grid, n, next, cur);
-                cur = next;
-            } else {
-                grid[next as usize] |= IN_WALK;
-                cur = next;
+/// Fill all remaining non-tree cells in a rectangular region using plain
+/// Wilson's algorithm.  The region must be bounded on all sides by in-tree
+/// cells (barrier rows/columns from parent splits) or by the grid edge.
+fn wilson_fill(grid: &Grid, rect: &Rect, rng: &mut u64) {
+    let n = grid.n;
+    for r in rect.row_start..rect.row_end {
+        for c in rect.col_start..rect.col_end {
+            let pos = r * n + c;
+            if grid.get(pos) & IN_MAZE == 0 {
+                wilson_walk_from(grid, pos, rng);
             }
         }
+    }
+}
 
-        // Trace the walk from `start` and carve passages into the maze.
-        cur = start;
-        loop {
-            let dir = (grid[cur as usize] & WALK_DIR_MASK) >> WALK_DIR_SHIFT;
-            let (next, _, _) = step(cur, n, dir);
-            carve(grid, n, cur, next, dir);
-            grid[cur as usize] = (grid[cur as usize] & (RIGHT | DOWN)) | IN_MAZE;
-            in_maze_count += 1;
+/// Run one loop-erased random walk from `start` until it hits the tree, then
+/// trace the walk path and carve passages.
+fn wilson_walk_from(grid: &Grid, start: u64, rng: &mut u64) {
+    let n = grid.n;
+    let mut cur = start;
+    grid.or(cur, IN_WALK);
+
+    loop {
+        let (next, dir, _) = random_neighbor(cur, n, rng);
+        let val = grid.get(cur);
+        grid.set(cur, (val & !WALK_DIR_MASK) | (dir << WALK_DIR_SHIFT));
+
+        if grid.get(next) & IN_MAZE != 0 {
+            break;
+        }
+        if grid.get(next) & IN_WALK != 0 {
+            grid.and_assign(cur, !IN_WALK);
+            erase_loop(grid, n, next, cur);
             cur = next;
-            if grid[cur as usize] & IN_MAZE != 0 {
-                break;
-            }
+        } else {
+            grid.or(next, IN_WALK);
+            cur = next;
+        }
+    }
+
+    // Trace the walk from `start` and carve passages into the maze.
+    cur = start;
+    loop {
+        let dir = (grid.get(cur) & WALK_DIR_MASK) >> WALK_DIR_SHIFT;
+        let (next, _, _) = step(cur, n, dir);
+        carve(grid, cur, next, dir);
+        let val = grid.get(cur);
+        grid.set(cur, (val & (RIGHT | DOWN)) | IN_MAZE);
+        cur = next;
+        if grid.get(cur) & IN_MAZE != 0 {
+            break;
         }
     }
 }
 
 /// Erase a loop: starting at `loop_start`, follow walk directions and clear
 /// IN_WALK until we reach `loop_end`.
-fn erase_loop(grid: &mut [u8], n: u64, loop_start: u64, loop_end: u64) {
+fn erase_loop(grid: &Grid, n: u64, loop_start: u64, loop_end: u64) {
     let mut pos = loop_start;
     loop {
-        let dir = (grid[pos as usize] & WALK_DIR_MASK) >> WALK_DIR_SHIFT;
+        let dir = (grid.get(pos) & WALK_DIR_MASK) >> WALK_DIR_SHIFT;
         let (next, _, _) = step(pos, n, dir);
         if next == loop_end {
-            // `loop_end` stays in the walk — we just broke the cycle
-            // by overwriting its direction when we get back to the outer loop.
             break;
         }
-        grid[next as usize] &= !IN_WALK;
+        grid.and_assign(next, !IN_WALK);
         pos = next;
     }
 }
 
 /// Carve a passage between `from` and `to` (which must be neighbors).
-/// `dir` is the direction from `from` to `to`.
-fn carve(grid: &mut [u8], _n: u64, from: u64, to: u64, dir: u8) {
+fn carve(grid: &Grid, from: u64, to: u64, dir: u8) {
     match dir {
-        DIR_RIGHT => grid[from as usize] |= RIGHT,
-        DIR_DOWN => grid[from as usize] |= DOWN,
-        DIR_LEFT => grid[to as usize] |= RIGHT,
-        DIR_UP => grid[to as usize] |= DOWN,
+        DIR_RIGHT => grid.or(from, RIGHT),
+        DIR_DOWN => grid.or(from, DOWN),
+        DIR_LEFT => grid.or(to, RIGHT),
+        DIR_UP => grid.or(to, DOWN),
         _ => unreachable!(),
     }
 }
 
 /// Step one cell in direction `dir` from position `pos`.
-/// Returns (new_pos, dir, reverse_dir).
 fn step(pos: u64, n: u64, dir: u8) -> (u64, u8, u8) {
     match dir {
         DIR_RIGHT => (pos + 1, DIR_RIGHT, DIR_LEFT),
@@ -299,17 +431,15 @@ fn step(pos: u64, n: u64, dir: u8) -> (u64, u8, u8) {
 }
 
 /// Pick a uniformly random valid neighbor of `pos` in the NxN grid.
-/// Returns (neighbor_pos, direction, reverse_direction).
 fn random_neighbor(pos: u64, n: u64, rng: &mut u64) -> (u64, u8, u8) {
     let row = pos / n;
     let col = pos % n;
 
-    // Count valid neighbors.
     let mut count: u8 = 0;
-    if col + 1 < n { count += 1; } // right
-    if row + 1 < n { count += 1; } // down
-    if col > 0 { count += 1; }     // left
-    if row > 0 { count += 1; }     // up
+    if col + 1 < n { count += 1; }
+    if row + 1 < n { count += 1; }
+    if col > 0 { count += 1; }
+    if row > 0 { count += 1; }
 
     let choice = (xorshift64(rng) % count as u64) as u8;
     let mut idx: u8 = 0;
