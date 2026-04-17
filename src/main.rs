@@ -1,6 +1,6 @@
-use memmap2::MmapMut;
+use memmap2::{Mmap, MmapMut};
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, BufWriter, Write};
 use std::process;
 
 /// Bit flags stored in each cell byte.
@@ -33,6 +33,8 @@ const DIR_UP: u8 = 3;
 
 fn usage() -> ! {
     eprintln!("usage: maze-gen N [OUTPUT]");
+    eprintln!("       maze-gen show FILE");
+    eprintln!();
     eprintln!("  N       side length of the maze (NxN cells)");
     eprintln!("  OUTPUT  output filename (default: maze.dat)");
     process::exit(1);
@@ -40,7 +42,18 @@ fn usage() -> ! {
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 || args.len() > 3 {
+    if args.len() < 2 {
+        usage();
+    }
+
+    if args[1] == "show" {
+        if args.len() != 3 {
+            usage();
+        }
+        return cmd_show(&args[2]);
+    }
+
+    if args.len() > 3 {
         usage();
     }
     let n: u64 = args[1].parse().unwrap_or_else(|_| usage());
@@ -68,6 +81,101 @@ fn main() -> io::Result<()> {
 
     eprintln!("wrote {n}×{n} maze to {output}");
     Ok(())
+}
+
+fn cmd_show(path: &str) -> io::Result<()> {
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let n = isqrt(len);
+    if n * n != len || n == 0 {
+        eprintln!("file size {len} is not a perfect square");
+        process::exit(1);
+    }
+    let mmap = unsafe { Mmap::map(&file)? };
+    show_maze(&mmap, n)
+}
+
+fn isqrt(x: u64) -> u64 {
+    if x == 0 {
+        return 0;
+    }
+    let mut r = (x as f64).sqrt() as u64;
+    // Correct for floating-point imprecision.
+    while r * r > x {
+        r -= 1;
+    }
+    while (r + 1) * (r + 1) <= x {
+        r += 1;
+    }
+    r
+}
+
+/// Display the maze using Unicode box-drawing characters.
+///
+/// Each cell is 3 chars wide and 1 char tall. Vertices use line-drawing
+/// glyphs chosen by which of the four directions have walls.
+fn show_maze(grid: &[u8], n: u64) -> io::Result<()> {
+    let out = io::stdout();
+    let mut w = BufWriter::new(out.lock());
+
+    // Box-drawing lookup: index = up(3) | right(2) | down(1) | left(0).
+    const BOX: [char; 16] = [
+        ' ', '╴', '╷', '┐',
+        '╶', '─', '┌', '┬',
+        '╵', '┘', '│', '┤',
+        '└', '┴', '├', '┼',
+    ];
+
+    let cell = |r: u64, c: u64| -> u8 { grid[(r * n + c) as usize] };
+
+    // Whether there is a horizontal wall above cell row `vr` between columns
+    // `vc` and `vc+1`.
+    let wall_h = |vr: u64, vc: u64| -> bool {
+        if vr == 0 || vr == n {
+            return true;
+        }
+        cell(vr - 1, vc) & DOWN == 0
+    };
+
+    // Whether there is a vertical wall left of cell column `vc` between rows
+    // `vr` and `vr+1`.
+    let wall_v = |vr: u64, vc: u64| -> bool {
+        if vc == 0 || vc == n {
+            return true;
+        }
+        cell(vr, vc - 1) & RIGHT == 0
+    };
+
+    for vr in 0..=n {
+        // Vertex row: vertices and horizontal segments.
+        for vc in 0..=n {
+            let mut bits: u8 = 0;
+            if vr > 0 && wall_v(vr - 1, vc) { bits |= 0b1000; } // up
+            if vc < n && wall_h(vr, vc) { bits |= 0b0100; }      // right
+            if vr < n && wall_v(vr, vc) { bits |= 0b0010; }      // down
+            if vc > 0 && wall_h(vr, vc - 1) { bits |= 0b0001; }  // left
+            write!(w, "{}", BOX[bits as usize])?;
+            if vc < n {
+                let seg = if wall_h(vr, vc) { "───" } else { "   " };
+                write!(w, "{seg}")?;
+            }
+        }
+        writeln!(w)?;
+
+        // Cell row: vertical segments and cell interiors.
+        if vr < n {
+            for vc in 0..=n {
+                let ch = if wall_v(vr, vc) { '│' } else { ' ' };
+                write!(w, "{ch}")?;
+                if vc < n {
+                    write!(w, "   ")?;
+                }
+            }
+            writeln!(w)?;
+        }
+    }
+
+    w.flush()
 }
 
 /// Create (or truncate) the output file and set it to the right size.
